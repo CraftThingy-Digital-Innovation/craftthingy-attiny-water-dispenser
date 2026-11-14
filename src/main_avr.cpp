@@ -5,22 +5,15 @@
  * Board: MH-ET LIVE Tiny88 / ATtiny88
  * Clock: 16.0 MHz (Micronucleus clock)
  *
- * Silkscreen Pin Mapping for MH-ET LIVE Tiny88:
- *   Left Side Pins:
- *     - "3" (PB3): Left Button (40 Seconds)
- *     - "4" (PB4): Middle Button (Toggle Continuous / Cancel)
- *     - "5" (PB5): Right Button (80 Seconds)
- *     - "6" (PC0): IRLZ44N Gate Output
- *     - "7" (PC1): Status LED Output
- *
- *   Right Side Pins (Standard PORTD):
- *     - "9"  (PD3): Left Button (Alternative)
- *     - "10" (PD4): Middle Button (Alternative)
- *     - "11" (PD5): Right Button (Alternative)
- *     - "12" (PD6): IRLZ44N Gate Output (Alternative)
- *     - "13" (PD7): Status LED Output (Alternative)
- *
- * Note: Both PORTB and PORTD are monitored and driven simultaneously!
+ * Features:
+ *   - Hardware Reset Diagnostic via LED blinks:
+ *       1 blink  = Power-On Reset (Normal boot)
+ *       2 blinks = External Reset (RST pin triggered!)
+ *       3 blinks = Brown-Out Reset (VCC voltage dipped/motor inrush!)
+ *       4 blinks = Watchdog Reset
+ *   - BADISR trap (spurious interrupts can never reset the chip)
+ *   - Dual port support (PORTB PB3..PB5 & PORTD PD3..PD5)
+ *   - Low-power deep sleep (PWR_DOWN: ~0.5uA)
  * =========================================================================
  */
 
@@ -31,6 +24,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
+#include <avr/wdt.h>
 #include <util/delay.h>
 
 // State variables
@@ -39,6 +33,11 @@ static volatile uint8_t is_pump_on = 0;
 static volatile uint8_t is_continuous = 0;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
+
+// Catch-all ISR: Any unhandled interrupt returns safely without resetting to 0x0000!
+ISR(BADISR_vect) {
+    // Safely ignore spurious interrupts
+}
 
 // Timer1 Compare Match A: 1 ms tick
 ISR(TIMER1_COMPA_vect) {
@@ -57,12 +56,10 @@ ISR(PCINT2_vect) {
 
 static inline void start_timer() {
     TCCR1A = 0;
-    // CTC Mode with WGM12 = 1, Prescaler 64: CS11 = 1, CS10 = 1
-    // 16MHz / 64 = 250kHz. OCR1A = 249 gives 250kHz / 250 = 1000 Hz (1ms tick)
-    OCR1A = 249;
+    OCR1A = 249; // 16MHz / 64 = 250kHz. 250 counts = 1ms tick
     TCNT1 = 0;
     TIFR1 = (1 << OCF1A);
-    TIMSK1 |= (1 << OCIE1A); // Enable Compare Match A interrupt
+    TIMSK1 |= (1 << OCIE1A);
     TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
 }
 
@@ -100,6 +97,15 @@ static inline void drive_led_low() {
     PORTD &= ~(1 << PD7);
 }
 
+static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
+    for (uint8_t i = 0; i < count; i++) {
+        drive_led_high();
+        for (uint16_t t = 0; t < on_ms; t += 10) _delay_ms(10);
+        drive_led_low();
+        for (uint16_t t = 0; t < off_ms; t += 10) _delay_ms(10);
+    }
+}
+
 static inline void turn_pump_on(uint32_t duration, uint8_t continuous) {
     is_pump_on = 1;
     is_continuous = continuous;
@@ -123,19 +129,15 @@ static inline void turn_pump_off() {
 static void enter_deep_sleep() {
     turn_pump_off();
 
-    // Deep sleep mode (~0.5uA)
     set_sleep_mode(SLEEP_MODE_PWR_DOWN);
     sleep_enable();
     sei();
 
-    // CPU pauses here until a button press triggers PCINT0 or PCINT2
     sleep_cpu();
 
-    // CPU wakes up here
     sleep_disable();
 }
 
-// Check button states (active LOW)
 static inline uint8_t is_btn_left_pressed() {
     return (!(PINB & (1 << PB3)) || !(PIND & (1 << PD3)));
 }
@@ -149,37 +151,46 @@ static inline uint8_t is_btn_right_pressed() {
 }
 
 int main(void) {
+    // 0. Read Reset Reason & Disable Watchdog immediately
+    uint8_t reset_flags = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
+
+    // Disable INT0/INT1 external interrupt mask (only use PCINT)
+    EIMSK = 0;
+
     // 1. Configure Button Inputs (with internal pull-ups):
-    // PORTB: PB3 (Pin 3), PB4 (Pin 4), PB5 (Pin 5)
     DDRB &= ~((1 << PB3) | (1 << PB4) | (1 << PB5));
     PORTB |= (1 << PB3) | (1 << PB4) | (1 << PB5);
 
-    // PORTD: PD3 (Pin 9), PD4 (Pin 10), PD5 (Pin 11)
     DDRD &= ~((1 << PD3) | (1 << PD4) | (1 << PD5));
     PORTD |= (1 << PD3) | (1 << PD4) | (1 << PD5);
 
-    // 2. Configure Outputs:
-    // PORTC: PC0 (Gate / Pin 6), PC1 (LED / Pin 7)
+    // 2. Configure Outputs (Gate & LED initially LOW):
     DDRC |= (1 << PC0) | (1 << PC1);
     PORTC &= ~((1 << PC0) | (1 << PC1));
 
-    // PORTD: PD6 (Gate / Pin 12), PD7 (LED / Pin 13)
     DDRD |= (1 << PD6) | (1 << PD7);
     PORTD &= ~((1 << PD6) | (1 << PD7));
 
     // 3. Configure Pin Change Interrupts:
-    // PCIE0 enables PCINT0..7 (PORTB: PB3=PCINT3, PB4=PCINT4, PB5=PCINT5)
-    // PCIE2 enables PCINT16..23 (PORTD: PD3=PCINT19, PD4=PCINT20, PD5=PCINT21)
     PCICR |= (1 << PCIE0) | (1 << PCIE2);
     PCMSK0 |= (1 << PCINT3) | (1 << PCINT4) | (1 << PCINT5);
     PCMSK2 |= (1 << PCINT19) | (1 << PCINT20) | (1 << PCINT21);
 
-    // 4. Startup Indicator: Blink LED 3 times quickly to signal boot ready
-    for (uint8_t i = 0; i < 3; i++) {
-        drive_led_high();
-        _delay_ms(100);
-        drive_led_low();
-        _delay_ms(100);
+    // 4. Diagnostic Reset Indicator:
+    // If Brown-out Reset (voltage dip from motor or short): 3 long blinks
+    // If External Reset (RST pin pulled low): 2 long blinks
+    // If Watchdog: 4 quick blinks
+    // Normal Power-On: 1 blink
+    if (reset_flags & (1 << BORF)) {
+        blink_led(3, 400, 200); // 3 long pulses = Brownout
+    } else if (reset_flags & (1 << EXTRF)) {
+        blink_led(2, 400, 200); // 2 long pulses = Reset Pin
+    } else if (reset_flags & (1 << WDRF)) {
+        blink_led(4, 150, 150); // 4 pulses = Watchdog
+    } else {
+        blink_led(1, 300, 200); // 1 clean pulse = Ready
     }
 
     // 5. Enable Global Interrupts
@@ -188,7 +199,7 @@ int main(void) {
     while (1) {
         if (!is_pump_on) {
             enter_deep_sleep();
-            _delay_ms(30); // Wake debounce
+            _delay_ms(50); // Wake debounce
         }
 
         uint32_t now = get_millis();
@@ -196,21 +207,21 @@ int main(void) {
         // Left Button: 40 Seconds Dispense
         if (is_btn_left_pressed()) {
             turn_pump_on(40000UL, 0);
-            _delay_ms(250); // Debounce
+            _delay_ms(250);
         }
         // Middle Button: Toggle Continuous ON / Cancel (Abort)
         else if (is_btn_mid_pressed()) {
             if (is_pump_on) {
                 turn_pump_off();
             } else {
-                turn_pump_on(0, 1); // Continuous ON
+                turn_pump_on(0, 1);
             }
-            _delay_ms(250); // Debounce
+            _delay_ms(250);
         }
         // Right Button: 80 Seconds Dispense
         else if (is_btn_right_pressed()) {
             turn_pump_on(80000UL, 0);
-            _delay_ms(250); // Debounce
+            _delay_ms(250);
         }
 
         // Automatic Timer Expiration Check
