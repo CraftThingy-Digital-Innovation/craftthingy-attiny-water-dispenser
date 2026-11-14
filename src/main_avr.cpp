@@ -45,54 +45,18 @@
 #define MODE_80S        2
 #define MODE_CONTINUOUS 3
 
+// Power Cap: 82% PWM (205 / 250 counts at 1kHz)
+// 820us ON, 180us OFF. Protects the TP4056 DW01A protection chip from
+// exceeding its 2.5A overcurrent trip limit when stepping up to 12V!
+#define PWM_TOP         249
+#define PWM_DUTY_RUN    205
+
 // State variables
 static volatile uint32_t system_millis = 0;
 static volatile uint8_t current_mode = MODE_IDLE;
+static volatile uint8_t pwm_enabled = 0;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
-
-// Catch-all ISR: Any unhandled interrupt returns safely without resetting to 0x0000!
-ISR(BADISR_vect) {
-    // Safely ignore spurious interrupts
-}
-
-// Timer1 Compare Match A: 1 ms tick
-ISR(TIMER1_COMPA_vect) {
-    system_millis++;
-}
-
-// PCINT0 Interrupt on PORTB (PB3, PB4, PB5 - Board Pins 3, 4, 5)
-ISR(PCINT0_vect) {
-    // Wake up from deep sleep
-}
-
-// PCINT2 Interrupt on PORTD (PD3, PD4, PD5 - Board Pins 9, 10, 11)
-ISR(PCINT2_vect) {
-    // Wake up from deep sleep
-}
-
-static inline void start_timer() {
-    TCCR1A = 0;
-    OCR1A = 249; // 16MHz / 64 = 250kHz. 250 counts = 1ms tick
-    TCNT1 = 0;
-    TIFR1 = (1 << OCF1A);
-    TIMSK1 |= (1 << OCIE1A);
-    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
-}
-
-static inline void stop_timer() {
-    TCCR1B = 0;
-    TIMSK1 &= ~(1 << OCIE1A);
-}
-
-static inline uint32_t get_millis() {
-    uint32_t m;
-    uint8_t sreg = SREG;
-    cli();
-    m = system_millis;
-    SREG = sreg;
-    return m;
-}
 
 static inline void drive_gate_high() {
     PORTC |= (1 << PC0); // Pin 6 (Left side)
@@ -114,11 +78,58 @@ static inline void drive_led_low() {
     PORTD &= ~(1 << PD7);
 }
 
-static void delay_micros(uint16_t us) {
-    while (us >= 20) {
-        _delay_us(20);
-        us -= 20;
+// Catch-all ISR: Any unhandled interrupt returns safely without resetting to 0x0000!
+ISR(BADISR_vect) {
+    // Safely ignore spurious interrupts
+}
+
+// Timer1 Compare Match A: 1 ms tick (Cycle start: Turn Gate ON)
+ISR(TIMER1_COMPA_vect) {
+    system_millis++;
+    if (pwm_enabled && (current_mode != MODE_IDLE)) {
+        drive_gate_high();
     }
+}
+
+// Timer1 Compare Match B: Duty cycle cutoff (Turn Gate OFF)
+ISR(TIMER1_COMPB_vect) {
+    drive_gate_low();
+}
+
+// PCINT0 Interrupt on PORTB (PB3, PB4, PB5 - Board Pins 3, 4, 5)
+ISR(PCINT0_vect) {
+    // Wake up from deep sleep
+}
+
+// PCINT2 Interrupt on PORTD (PD3, PD4, PD5 - Board Pins 9, 10, 11)
+ISR(PCINT2_vect) {
+    // Wake up from deep sleep
+}
+
+static inline void start_timer() {
+    TCCR1A = 0;
+    OCR1A = PWM_TOP;      // 249: 16MHz / 64 = 250kHz. 250 counts = 1ms tick
+    OCR1B = 10;           // Start with gentle 4% duty for soft-start
+    TCNT1 = 0;
+    TIFR1 = (1 << OCF1A) | (1 << OCF1B);
+    TIMSK1 |= (1 << OCIE1A) | (1 << OCIE1B);
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC mode, prescaler 64
+}
+
+static inline void stop_timer() {
+    TCCR1B = 0;
+    TIMSK1 &= ~((1 << OCIE1A) | (1 << OCIE1B));
+    drive_gate_low();
+    pwm_enabled = 0;
+}
+
+static inline uint32_t get_millis() {
+    uint32_t m;
+    uint8_t sreg = SREG;
+    cli();
+    m = system_millis;
+    SREG = sreg;
+    return m;
 }
 
 static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blinks) {
@@ -135,35 +146,29 @@ static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blin
 /**
  * Soft-Start Motor Ramp with Concurrent Mode Blinking:
  * Motor starts INSTANTLY upon button press with 0ms waiting time.
- * Gradually increases duty cycle to 100% over 500ms while blinking the
- * LED in parallel (1x for 40s, 2x for 80s, 3x for continuous).
- * Locks at 100% full power and solid LED upon completion.
+ * Gradually increases duty cycle from 4% to 82% over 500ms using Timer1
+ * hardware interrupts while blinking the LED in parallel.
+ * Locks at 82% safe continuous power (safe for DW01A) and solid LED upon completion.
  */
 static void soft_start_motor(uint8_t blinks) {
+    pwm_enabled = 1;
+
     for (uint8_t step = 1; step <= 50; step++) {
+        // Ramp duty cycle from 10 up to 205 (82% power) over 500ms
+        uint16_t duty = 10 + ((uint32_t)step * (PWM_DUTY_RUN - 10)) / 50;
+        OCR1B = (uint8_t)duty;
+
         if (is_led_active_during_soft_start(step, blinks)) {
             drive_led_high();
         } else {
             drive_led_low();
         }
 
-        uint16_t on_us = (uint16_t)step * 20;
-        uint16_t off_us = 1000 - on_us;
-
-        for (uint8_t cycle = 0; cycle < 10; cycle++) {
-            if (on_us > 0) {
-                drive_gate_high();
-                delay_micros(on_us);
-            }
-            if (off_us > 0) {
-                drive_gate_low();
-                delay_micros(off_us);
-            }
-        }
+        _delay_ms(10); // 50 steps * 10ms = 500ms
     }
 
-    // 100% Full Continuous Power & Solid LED
-    drive_gate_high();
+    // Locked at safe 82% continuous power & Solid LED
+    OCR1B = PWM_DUTY_RUN;
     drive_led_high();
 }
 

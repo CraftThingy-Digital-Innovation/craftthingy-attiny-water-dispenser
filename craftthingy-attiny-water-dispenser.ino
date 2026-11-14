@@ -37,42 +37,16 @@
 #define MODE_80S        2
 #define MODE_CONTINUOUS 3
 
+// Power Cap: 82% PWM (205 / 250 counts at 1kHz)
+// Protects the TP4056 DW01A protection chip from exceeding its 2.5A overcurrent trip limit!
+#define PWM_TOP         249
+#define PWM_DUTY_RUN    205
+
 static volatile uint32_t system_millis = 0;
 static volatile uint8_t current_mode = MODE_IDLE;
+static volatile uint8_t pwm_enabled = 0;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
-
-ISR(BADISR_vect) {}
-
-ISR(TIMER1_COMPA_vect) {
-    system_millis++;
-}
-
-ISR(PCINT0_vect) {}
-ISR(PCINT2_vect) {}
-
-static inline void start_timer() {
-    TCCR1A = 0;
-    OCR1A = 249;
-    TCNT1 = 0;
-    TIFR1 = (1 << OCF1A);
-    TIMSK1 |= (1 << OCIE1A);
-    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
-}
-
-static inline void stop_timer() {
-    TCCR1B = 0;
-    TIMSK1 &= ~(1 << OCIE1A);
-}
-
-static inline uint32_t get_millis() {
-    uint32_t m;
-    uint8_t sreg = SREG;
-    cli();
-    m = system_millis;
-    SREG = sreg;
-    return m;
-}
 
 static inline void drive_gate_high() {
     PORTC |= (1 << PC0);
@@ -94,6 +68,48 @@ static inline void drive_led_low() {
     PORTD &= ~(1 << PD7);
 }
 
+ISR(BADISR_vect) {}
+
+ISR(TIMER1_COMPA_vect) {
+    system_millis++;
+    if (pwm_enabled && (current_mode != MODE_IDLE)) {
+        drive_gate_high();
+    }
+}
+
+ISR(TIMER1_COMPB_vect) {
+    drive_gate_low();
+}
+
+ISR(PCINT0_vect) {}
+ISR(PCINT2_vect) {}
+
+static inline void start_timer() {
+    TCCR1A = 0;
+    OCR1A = PWM_TOP;
+    OCR1B = 10;
+    TCNT1 = 0;
+    TIFR1 = (1 << OCF1A) | (1 << OCF1B);
+    TIMSK1 |= (1 << OCIE1A) | (1 << OCIE1B);
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
+}
+
+static inline void stop_timer() {
+    TCCR1B = 0;
+    TIMSK1 &= ~((1 << OCIE1A) | (1 << OCIE1B));
+    drive_gate_low();
+    pwm_enabled = 0;
+}
+
+static inline uint32_t get_millis() {
+    uint32_t m;
+    uint8_t sreg = SREG;
+    cli();
+    m = system_millis;
+    SREG = sreg;
+    return m;
+}
+
 static void delay_micros(uint16_t us) {
     while (us >= 20) {
         _delay_us(20);
@@ -113,30 +129,23 @@ static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blin
 }
 
 static void soft_start_motor(uint8_t blinks) {
+    pwm_enabled = 1;
+
     for (uint8_t step = 1; step <= 50; step++) {
+        uint16_t duty = 10 + ((uint32_t)step * (PWM_DUTY_RUN - 10)) / 50;
+        OCR1B = (uint8_t)duty;
+
         if (is_led_active_during_soft_start(step, blinks)) {
             drive_led_high();
         } else {
             drive_led_low();
         }
 
-        uint16_t on_us = (uint16_t)step * 20;
-        uint16_t off_us = 1000 - on_us;
-
-        for (uint8_t cycle = 0; cycle < 10; cycle++) {
-            if (on_us > 0) {
-                drive_gate_high();
-                delay_micros(on_us);
-            }
-            if (off_us > 0) {
-                drive_gate_low();
-                delay_micros(off_us);
-            }
-        }
+        _delay_ms(10);
     }
 
-    // 100% Full Power Continuous Output & Solid LED
-    drive_gate_high();
+    // Locked at safe 82% continuous power & Solid LED
+    OCR1B = PWM_DUTY_RUN;
     drive_led_high();
 }
 
