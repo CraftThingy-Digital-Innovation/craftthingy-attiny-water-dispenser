@@ -101,11 +101,25 @@ static void delay_micros(uint16_t us) {
     }
 }
 
-static void soft_start_motor() {
-    drive_led_high();
+static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blinks) {
+    if (blinks == 1) {
+        return (step <= 25);
+    } else if (blinks == 2) {
+        return (step <= 12) || (step >= 26 && step <= 37);
+    } else if (blinks == 3) {
+        return (step <= 8) || (step >= 17 && step <= 24) || (step >= 33 && step <= 41);
+    }
+    return 1;
+}
 
-    // 500ms smooth ramp up
+static void soft_start_motor(uint8_t blinks) {
     for (uint8_t step = 1; step <= 50; step++) {
+        if (is_led_active_during_soft_start(step, blinks)) {
+            drive_led_high();
+        } else {
+            drive_led_low();
+        }
+
         uint16_t on_us = (uint16_t)step * 20;
         uint16_t off_us = 1000 - on_us;
 
@@ -121,8 +135,9 @@ static void soft_start_motor() {
         }
     }
 
-    // 100% Full Power Continuous Output
+    // 100% Full Power Continuous Output & Solid LED
     drive_gate_high();
+    drive_led_high();
 }
 
 static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
@@ -138,12 +153,11 @@ static void turn_pump_on_fresh(uint8_t mode, uint32_t duration, uint8_t blinks) 
     current_mode = mode;
     pump_duration = duration;
 
-    // Visual mode confirmation feedback: 1 for 40s, 2 for 80s, 3 for Continuous
-    blink_led(blinks, 150, 150);
-
     start_timer();
     pump_start_time = get_millis();
-    soft_start_motor(); // 500ms ramp, then 100% full power!
+
+    // Motor starts INSTANTLY with 0ms delay! Blinks concurrently during 500ms ramp
+    soft_start_motor(blinks);
 }
 
 static void turn_pump_off() {
