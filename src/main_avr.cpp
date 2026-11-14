@@ -5,14 +5,10 @@
  * Board: MH-ET LIVE Tiny88 / ATtiny88
  * Clock: 16.0 MHz (Micronucleus clock)
  *
- * Features:
- *   - Hardware Reset Diagnostic via LED blinks:
- *       1 blink  = Power-On Reset (Normal boot)
- *       2 blinks = External Reset (RST pin triggered!)
- *       3 blinks = Brown-Out Reset (VCC voltage dipped/motor inrush!)
- *       4 blinks = Watchdog Reset
- *   - BADISR trap (spurious interrupts can never reset the chip)
- *   - Dual port support (PORTB PB3..PB5 & PORTD PD3..PD5)
+ * Updates:
+ *   - Soft-Start PWM Ramp: Smooth 500ms ramp prevents high inrush stall
+ *     current from tripping the battery protection circuit (BMS).
+ *   - Dual Port Support (PORTB & PORTD)
  *   - Low-power deep sleep (PWR_DOWN: ~0.5uA)
  * =========================================================================
  */
@@ -97,6 +93,44 @@ static inline void drive_led_low() {
     PORTD &= ~(1 << PD7);
 }
 
+static void delay_micros(uint16_t us) {
+    while (us >= 20) {
+        _delay_us(20);
+        us -= 20;
+    }
+}
+
+/**
+ * Soft-Start Motor Ramp:
+ * Gradually increases the MOSFET duty cycle over ~500ms using a 1kHz PWM.
+ * This prevents the stationary motor coils from creating an instantaneous
+ * stall inrush spike that collapses the battery rail or trips the BMS.
+ */
+static void soft_start_motor() {
+    drive_led_high(); // Turn LED on immediately for feedback
+
+    // 50 steps x 10ms per step = 500ms smooth ramp
+    for (uint8_t step = 1; step <= 50; step++) {
+        uint16_t on_us = (uint16_t)step * 20; // 20us up to 1000us
+        uint16_t off_us = 1000 - on_us;
+
+        // Run 10 PWM cycles (10 x 1ms = 10ms) at this duty cycle
+        for (uint8_t cycle = 0; cycle < 10; cycle++) {
+            if (on_us > 0) {
+                drive_gate_high();
+                delay_micros(on_us);
+            }
+            if (off_us > 0) {
+                drive_gate_low();
+                delay_micros(off_us);
+            }
+        }
+    }
+
+    // Fully lock Gate ON once up to speed
+    drive_gate_high();
+}
+
 static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
     for (uint8_t i = 0; i < count; i++) {
         drive_led_high();
@@ -113,8 +147,7 @@ static inline void turn_pump_on(uint32_t duration, uint8_t continuous) {
     pump_duration = duration;
 
     start_timer();
-    drive_gate_high();
-    drive_led_high();
+    soft_start_motor(); // Smooth PWM ramp up
 }
 
 static inline void turn_pump_off() {
@@ -155,8 +188,6 @@ int main(void) {
     uint8_t reset_flags = MCUSR;
     MCUSR = 0;
     wdt_disable();
-
-    // Disable INT0/INT1 external interrupt mask (only use PCINT)
     EIMSK = 0;
 
     // 1. Configure Button Inputs (with internal pull-ups):
@@ -179,10 +210,6 @@ int main(void) {
     PCMSK2 |= (1 << PCINT19) | (1 << PCINT20) | (1 << PCINT21);
 
     // 4. Diagnostic Reset Indicator:
-    // If Brown-out Reset (voltage dip from motor or short): 3 long blinks
-    // If External Reset (RST pin pulled low): 2 long blinks
-    // If Watchdog: 4 quick blinks
-    // Normal Power-On: 1 blink
     if (reset_flags & (1 << BORF)) {
         blink_led(3, 400, 200); // 3 long pulses = Brownout
     } else if (reset_flags & (1 << EXTRF)) {
