@@ -5,11 +5,20 @@
  * Board: MH-ET LIVE Tiny88 / ATtiny88
  * Clock: 16.0 MHz (Micronucleus clock)
  *
- * Updates:
- *   - Soft-Start PWM Ramp: Smooth 500ms ramp prevents high inrush stall
- *     current from tripping the battery protection circuit (BMS).
- *   - Dual Port Support (PORTB & PORTD)
- *   - Low-power deep sleep (PWR_DOWN: ~0.5uA)
+ * Smart Dispense Features:
+ *   - Same-Button Toggle:
+ *       * Press 40s while 40s is running -> STOPS immediately.
+ *       * Press 80s while 80s is running -> STOPS immediately.
+ *   - Smart Duration Extension (40s -> 80s):
+ *       * If 40s is running and user presses 80s, total pour target becomes
+ *         80s from the initial start (remaining time = 80s - elapsed).
+ *   - Impossible Time Switch (80s -> 40s):
+ *       * If 80s is running and user presses 40s, immediately STOPS the pump.
+ *   - Middle Button:
+ *       * If pump is OFF -> Starts Continuous ON.
+ *       * If pump is ON (any mode) -> Cancels and STOPS immediately.
+ *   - 500ms PWM Soft-Start: Protects battery BMS from inrush current.
+ *   - Ultra-low power Deep Sleep: ~0.5uA when idle.
  * =========================================================================
  */
 
@@ -23,10 +32,15 @@
 #include <avr/wdt.h>
 #include <util/delay.h>
 
+// Dispenser Operating Modes
+#define MODE_IDLE       0
+#define MODE_40S        1
+#define MODE_80S        2
+#define MODE_CONTINUOUS 3
+
 // State variables
 static volatile uint32_t system_millis = 0;
-static volatile uint8_t is_pump_on = 0;
-static volatile uint8_t is_continuous = 0;
+static volatile uint8_t current_mode = MODE_IDLE;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
 
@@ -103,18 +117,15 @@ static void delay_micros(uint16_t us) {
 /**
  * Soft-Start Motor Ramp:
  * Gradually increases the MOSFET duty cycle over ~500ms using a 1kHz PWM.
- * This prevents the stationary motor coils from creating an instantaneous
- * stall inrush spike that collapses the battery rail or trips the BMS.
+ * Eliminates startup inrush stall spikes that trip battery BMS circuits.
  */
 static void soft_start_motor() {
-    drive_led_high(); // Turn LED on immediately for feedback
+    drive_led_high();
 
-    // 50 steps x 10ms per step = 500ms smooth ramp
     for (uint8_t step = 1; step <= 50; step++) {
-        uint16_t on_us = (uint16_t)step * 20; // 20us up to 1000us
+        uint16_t on_us = (uint16_t)step * 20;
         uint16_t off_us = 1000 - on_us;
 
-        // Run 10 PWM cycles (10 x 1ms = 10ms) at this duty cycle
         for (uint8_t cycle = 0; cycle < 10; cycle++) {
             if (on_us > 0) {
                 drive_gate_high();
@@ -127,7 +138,6 @@ static void soft_start_motor() {
         }
     }
 
-    // Fully lock Gate ON once up to speed
     drive_gate_high();
 }
 
@@ -140,19 +150,17 @@ static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
     }
 }
 
-static inline void turn_pump_on(uint32_t duration, uint8_t continuous) {
-    is_pump_on = 1;
-    is_continuous = continuous;
-    pump_start_time = get_millis();
+static void turn_pump_on_fresh(uint8_t mode, uint32_t duration) {
+    current_mode = mode;
     pump_duration = duration;
+    pump_start_time = get_millis();
 
     start_timer();
-    soft_start_motor(); // Smooth PWM ramp up
+    soft_start_motor();
 }
 
-static inline void turn_pump_off() {
-    is_pump_on = 0;
-    is_continuous = 0;
+static void turn_pump_off() {
+    current_mode = MODE_IDLE;
 
     drive_gate_low();
     drive_led_low();
@@ -184,7 +192,7 @@ static inline uint8_t is_btn_right_pressed() {
 }
 
 int main(void) {
-    // 0. Read Reset Reason & Disable Watchdog immediately
+    // 0. Reset Reason & Watchdog disable
     uint8_t reset_flags = MCUSR;
     MCUSR = 0;
     wdt_disable();
@@ -211,48 +219,87 @@ int main(void) {
 
     // 4. Diagnostic Reset Indicator:
     if (reset_flags & (1 << BORF)) {
-        blink_led(3, 400, 200); // 3 long pulses = Brownout
+        blink_led(3, 400, 200);
     } else if (reset_flags & (1 << EXTRF)) {
-        blink_led(2, 400, 200); // 2 long pulses = Reset Pin
+        blink_led(2, 400, 200);
     } else if (reset_flags & (1 << WDRF)) {
-        blink_led(4, 150, 150); // 4 pulses = Watchdog
+        blink_led(4, 150, 150);
     } else {
-        blink_led(1, 300, 200); // 1 clean pulse = Ready
+        blink_led(1, 300, 200);
     }
 
     // 5. Enable Global Interrupts
     sei();
 
     while (1) {
-        if (!is_pump_on) {
+        // Sleep only when idle
+        if (current_mode == MODE_IDLE) {
             enter_deep_sleep();
             _delay_ms(50); // Wake debounce
         }
 
         uint32_t now = get_millis();
 
-        // Left Button: 40 Seconds Dispense
+        // =================================================================
+        // BUTTON 1: LEFT BUTTON (40s)
+        // =================================================================
         if (is_btn_left_pressed()) {
-            turn_pump_on(40000UL, 0);
-            _delay_ms(250);
-        }
-        // Middle Button: Toggle Continuous ON / Cancel (Abort)
-        else if (is_btn_mid_pressed()) {
-            if (is_pump_on) {
+            if (current_mode == MODE_40S) {
+                // Pressed 40s again while 40s running -> STOP!
+                turn_pump_off();
+            } else if (current_mode == MODE_80S) {
+                // Switched from 80s to 40s -> Stop/cancel immediately
+                turn_pump_off();
+            } else if (current_mode == MODE_CONTINUOUS) {
+                // Cancel continuous -> STOP
                 turn_pump_off();
             } else {
-                turn_pump_on(0, 1);
+                // Fresh start: 40s
+                turn_pump_on_fresh(MODE_40S, 40000UL);
             }
-            _delay_ms(250);
-        }
-        // Right Button: 80 Seconds Dispense
-        else if (is_btn_right_pressed()) {
-            turn_pump_on(80000UL, 0);
-            _delay_ms(250);
+            _delay_ms(300); // Button debounce
         }
 
-        // Automatic Timer Expiration Check
-        if (is_pump_on && !is_continuous) {
+        // =================================================================
+        // BUTTON 2: MIDDLE BUTTON (Toggle Continuous ON / Cancel / Abort)
+        // =================================================================
+        else if (is_btn_mid_pressed()) {
+            if (current_mode != MODE_IDLE) {
+                // If running in ANY mode, cancel and stop immediately!
+                turn_pump_off();
+            } else {
+                // If OFF, start continuous dispensing
+                turn_pump_on_fresh(MODE_CONTINUOUS, 0);
+            }
+            _delay_ms(300); // Button debounce
+        }
+
+        // =================================================================
+        // BUTTON 3: RIGHT BUTTON (80s)
+        // =================================================================
+        else if (is_btn_right_pressed()) {
+            if (current_mode == MODE_80S) {
+                // Pressed 80s again while 80s running -> STOP!
+                turn_pump_off();
+            } else if (current_mode == MODE_40S) {
+                // Switched from 40s to 80s! Total target becomes 80s from initial start
+                current_mode = MODE_80S;
+                pump_duration = 80000UL;
+                // Pump continues running seamlessly to complete 80s total!
+            } else if (current_mode == MODE_CONTINUOUS) {
+                // Cancel continuous -> STOP
+                turn_pump_off();
+            } else {
+                // Fresh start: 80s
+                turn_pump_on_fresh(MODE_80S, 80000UL);
+            }
+            _delay_ms(300); // Button debounce
+        }
+
+        // =================================================================
+        // AUTOMATIC TIMER EXPIRATION
+        // =================================================================
+        if (current_mode == MODE_40S || current_mode == MODE_80S) {
             if ((now - pump_start_time) >= pump_duration) {
                 turn_pump_off();
             }
