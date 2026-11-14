@@ -228,10 +228,26 @@ int main(void) {
     PCMSK2 |= (1 << PCINT19) | (1 << PCINT20) | (1 << PCINT21);
 
     // 4. Diagnostic Reset Indicator:
-    // If a fault/failure occurred (Brown-Out BORF or Watchdog WDRF), blink 2 times first for diagnostics.
-    // If clean startup (nothing happened / no failure), do not blink error.
-    if (reset_flags & ((1 << BORF) | (1 << WDRF))) {
-        blink_led(2, 400, 250);
+    // If a hardware reset fault occurred (BORF, WDRF, EXTRF):
+    //   Step 1: 2 rapid blinks (80ms on/80ms off) as the Alert Prefix
+    //   Step 2: 800ms pause
+    //   Step 3: Specific Error Code blinks:
+    //           - 1 blink : Brown-Out Reset (BORF - Battery sag / voltage drop < 2.7V)
+    //           - 2 blinks: Watchdog Reset (WDRF - CPU hung / lockup)
+    //           - 3 blinks: External Reset (EXTRF - Noise on reset pin)
+    // If clean boot (PORF or 0), zero error blinks occur.
+    if (reset_flags & (1 << BORF)) {
+        blink_led(2, 80, 80);    // 2 rapid alert blinks
+        _delay_ms(800);
+        blink_led(1, 400, 250);  // Code 1: Brown-Out
+    } else if (reset_flags & (1 << WDRF)) {
+        blink_led(2, 80, 80);    // 2 rapid alert blinks
+        _delay_ms(800);
+        blink_led(2, 400, 250);  // Code 2: Watchdog
+    } else if (reset_flags & (1 << EXTRF)) {
+        blink_led(2, 80, 80);    // 2 rapid alert blinks
+        _delay_ms(800);
+        blink_led(3, 400, 250);  // Code 3: External Reset
     }
 
     // 5. Enable Global Interrupts

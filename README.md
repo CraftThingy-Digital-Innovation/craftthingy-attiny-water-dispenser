@@ -100,13 +100,34 @@ stateDiagram-v2
 
 | ATtiny88 Pin | Physical Function | Active State | Notes |
 | :--- | :--- | :--- | :--- |
-| **Pin 3 (PD3)** | Left Button (40s Dispense) | Active LOW | `INPUT_PULLUP` + `PCINT19` |
-| **Pin 4 (PD4)** | Middle Button (Toggle / Cancel) | Active LOW | `INPUT_PULLUP` + `PCINT20` |
-| **Pin 5 (PD5)** | Right Button (80s Dispense) | Active LOW | `INPUT_PULLUP` + `PCINT21` |
-| **Pin 6 (PD6)** | MOSFET Gate Control | Active HIGH | Drives IRLZ44N through 220 $\Omega$ |
-| **Pin 7 (PD7)** | Status LED Indicator | Active HIGH | High during pump operation |
-| **5V Pin** | Power Input | 3.2V – 4.2V | Solder to Battery `B+` (Bypasses onboard LDO) |
-| **GND Pin** | Common System Ground | 0V | Solder to Battery `B-` |
+| **Pin 3 (PB3 / PD3)** | Left Button (40s Dispense) | Active LOW | `INPUT_PULLUP` + `PCINT` |
+| **Pin 4 (PB4 / PD4)** | Middle Button (Toggle / Cancel) | Active LOW | `INPUT_PULLUP` + `PCINT` |
+| **Pin 5 (PB5 / PD5)** | Right Button (80s Dispense) | Active LOW | `INPUT_PULLUP` + `PCINT` |
+| **Pin 6 (PC0 / PD6)** | MOSFET Gate Control | Active HIGH | Drives IRLZ44N through 220 $\Omega$ |
+| **Pin 7 (PC1 / PD7)** | Status LED Indicator | Active HIGH | High during pump operation |
+| **5V Pin** | Power Input | 3.2V – 4.2V | Solder to Battery `OUT+` |
+| **GND Pin** | Common System Ground | 0V | Solder to Battery `OUT-` |
+
+---
+
+## 💡 LED Feedback & Diagnostics Table
+
+### 1. Boot Diagnostics (Hardware Reset Codes)
+| Pattern | Cause | Description / Troubleshooting |
+| :--- | :--- | :--- |
+| **0 Blinks** | Normal Power-On (`PORF`) | Clean start. ATtiny enters ultra-low power sleep immediately. |
+| **2 Rapid Blinks + 1 Long Blink** | Brown-Out Reset (`BORF`) | Battery voltage dropped below 2.7V (inrush current or low battery). |
+| **2 Rapid Blinks + 2 Long Blinks** | Watchdog Reset (`WDRF`) | CPU lockup or watchdog timeout detected. |
+| **2 Rapid Blinks + 3 Long Blinks** | External Reset (`EXTRF`) | Electrical transient/noise detected on the physical Reset pin. |
+
+### 2. Operational Mode Feedback
+| Action / Mode | LED Pattern | Description |
+| :--- | :--- | :--- |
+| **Press 40s (Left)** | **1 Blink** $\to$ Solid ON | 40s dispense started at 100% full power. |
+| **Press 80s (Right)** | **2 Blinks** $\to$ Solid ON | 80s dispense started at 100% full power. |
+| **Press Middle (Toggle)** | **3 Blinks** $\to$ Solid ON | Continuous dispense started at 100% full power. |
+| **Switch 40s $\to$ 80s** | **2 Blinks** $\to$ Solid ON | Dispense target extended to 80s total without stopping motor. |
+| **Same-Button or Cancel** | **Instant OFF** | Pump stops immediately; board enters deep sleep. |
 
 ---
 
