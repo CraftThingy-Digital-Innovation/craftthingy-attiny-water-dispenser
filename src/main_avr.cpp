@@ -45,16 +45,9 @@
 #define MODE_80S        2
 #define MODE_CONTINUOUS 3
 
-// Power Cap: 82% PWM (205 / 250 counts at 1kHz)
-// 820us ON, 180us OFF. Protects the TP4056 DW01A protection chip from
-// exceeding its 2.5A overcurrent trip limit when stepping up to 12V!
-#define PWM_TOP         249
-#define PWM_DUTY_RUN    205
-
 // State variables
 static volatile uint32_t system_millis = 0;
 static volatile uint8_t current_mode = MODE_IDLE;
-static volatile uint8_t pwm_enabled = 0;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
 
@@ -78,22 +71,21 @@ static inline void drive_led_low() {
     PORTD &= ~(1 << PD7);
 }
 
+static void delay_micros(uint16_t us) {
+    while (us >= 20) {
+        _delay_us(20);
+        us -= 20;
+    }
+}
+
 // Catch-all ISR: Any unhandled interrupt returns safely without resetting to 0x0000!
 ISR(BADISR_vect) {
     // Safely ignore spurious interrupts
 }
 
-// Timer1 Compare Match A: 1 ms tick (Cycle start: Turn Gate ON)
+// Timer1 Compare Match A: 1 ms tick
 ISR(TIMER1_COMPA_vect) {
     system_millis++;
-    if (pwm_enabled && (current_mode != MODE_IDLE)) {
-        drive_gate_high();
-    }
-}
-
-// Timer1 Compare Match B: Duty cycle cutoff (Turn Gate OFF)
-ISR(TIMER1_COMPB_vect) {
-    drive_gate_low();
 }
 
 // PCINT0 Interrupt on PORTB (PB3, PB4, PB5 - Board Pins 3, 4, 5)
@@ -108,19 +100,16 @@ ISR(PCINT2_vect) {
 
 static inline void start_timer() {
     TCCR1A = 0;
-    OCR1A = PWM_TOP;      // 249: 16MHz / 64 = 250kHz. 250 counts = 1ms tick
-    OCR1B = 10;           // Start with gentle 4% duty for soft-start
+    OCR1A = 249; // 16MHz / 64 = 250kHz. 250 counts = 1ms tick
     TCNT1 = 0;
-    TIFR1 = (1 << OCF1A) | (1 << OCF1B);
-    TIMSK1 |= (1 << OCIE1A) | (1 << OCIE1B);
-    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC mode, prescaler 64
+    TIFR1 = (1 << OCF1A);
+    TIMSK1 |= (1 << OCIE1A);
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
 }
 
 static inline void stop_timer() {
     TCCR1B = 0;
-    TIMSK1 &= ~((1 << OCIE1A) | (1 << OCIE1B));
-    drive_gate_low();
-    pwm_enabled = 0;
+    TIMSK1 &= ~(1 << OCIE1A);
 }
 
 static inline uint32_t get_millis() {
@@ -146,29 +135,35 @@ static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blin
 /**
  * Soft-Start Motor Ramp with Concurrent Mode Blinking:
  * Motor starts INSTANTLY upon button press with 0ms waiting time.
- * Gradually increases duty cycle from 4% to 82% over 500ms using Timer1
- * hardware interrupts while blinking the LED in parallel.
- * Locks at 82% safe continuous power (safe for DW01A) and solid LED upon completion.
+ * Gradually increases duty cycle to 100% over 500ms while blinking the
+ * LED in parallel (1x for 40s, 2x for 80s, 3x for continuous).
+ * Locks at 100% full continuous power and solid LED upon completion.
  */
 static void soft_start_motor(uint8_t blinks) {
-    pwm_enabled = 1;
-
     for (uint8_t step = 1; step <= 50; step++) {
-        // Ramp duty cycle from 10 up to 205 (82% power) over 500ms
-        uint16_t duty = 10 + ((uint32_t)step * (PWM_DUTY_RUN - 10)) / 50;
-        OCR1B = (uint8_t)duty;
-
         if (is_led_active_during_soft_start(step, blinks)) {
             drive_led_high();
         } else {
             drive_led_low();
         }
 
-        _delay_ms(10); // 50 steps * 10ms = 500ms
+        uint16_t on_us = (uint16_t)step * 20;
+        uint16_t off_us = 1000 - on_us;
+
+        for (uint8_t cycle = 0; cycle < 10; cycle++) {
+            if (on_us > 0) {
+                drive_gate_high();
+                delay_micros(on_us);
+            }
+            if (off_us > 0) {
+                drive_gate_low();
+                delay_micros(off_us);
+            }
+        }
     }
 
-    // Locked at safe 82% continuous power & Solid LED
-    OCR1B = PWM_DUTY_RUN;
+    // 100% Full Continuous Power & Solid LED
+    drive_gate_high();
     drive_led_high();
 }
 
@@ -179,6 +174,45 @@ static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
         drive_led_low();
         for (uint16_t t = 0; t < off_ms; t += 10) _delay_ms(10);
     }
+}
+
+static inline uint8_t is_btn_left_raw() {
+    return (!(PINB & (1 << PB3)) || !(PIND & (1 << PD3)));
+}
+
+static inline uint8_t is_btn_mid_raw() {
+    return (!(PINB & (1 << PB4)) || !(PIND & (1 << PD4)));
+}
+
+static inline uint8_t is_btn_right_raw() {
+    return (!(PINB & (1 << PB5)) || !(PIND & (1 << PD5)));
+}
+
+// 50ms Anti-Spark Noise Filter:
+// Completely rejects motor brush sparks and transient spikes.
+// Only returns true if button is held LOW solidly for 50ms continuously!
+static uint8_t is_btn_left_debounced() {
+    if (is_btn_left_raw()) {
+        _delay_ms(50);
+        return is_btn_left_raw();
+    }
+    return 0;
+}
+
+static uint8_t is_btn_mid_debounced() {
+    if (is_btn_mid_raw()) {
+        _delay_ms(50);
+        return is_btn_mid_raw();
+    }
+    return 0;
+}
+
+static uint8_t is_btn_right_debounced() {
+    if (is_btn_right_raw()) {
+        _delay_ms(50);
+        return is_btn_right_raw();
+    }
+    return 0;
 }
 
 static void turn_pump_on_fresh(uint8_t mode, uint32_t duration, uint8_t blinks) {
@@ -210,18 +244,6 @@ static void enter_deep_sleep() {
     sleep_cpu();
 
     sleep_disable();
-}
-
-static inline uint8_t is_btn_left_pressed() {
-    return (!(PINB & (1 << PB3)) || !(PIND & (1 << PD3)));
-}
-
-static inline uint8_t is_btn_mid_pressed() {
-    return (!(PINB & (1 << PB4)) || !(PIND & (1 << PD4)));
-}
-
-static inline uint8_t is_btn_right_pressed() {
-    return (!(PINB & (1 << PB5)) || !(PIND & (1 << PD5)));
 }
 
 int main(void) {
@@ -288,7 +310,7 @@ int main(void) {
         // =================================================================
         // BUTTON 1: LEFT BUTTON (40s)
         // =================================================================
-        if (is_btn_left_pressed()) {
+        if (is_btn_left_debounced()) {
             if (current_mode == MODE_40S) {
                 // Pressed 40s again while 40s running -> STOP!
                 turn_pump_off();
@@ -308,7 +330,7 @@ int main(void) {
         // =================================================================
         // BUTTON 2: MIDDLE BUTTON (Toggle Continuous ON / Cancel / Abort)
         // =================================================================
-        else if (is_btn_mid_pressed()) {
+        else if (is_btn_mid_debounced()) {
             if (current_mode != MODE_IDLE) {
                 // If running in ANY mode, cancel and stop immediately!
                 turn_pump_off();
@@ -322,7 +344,7 @@ int main(void) {
         // =================================================================
         // BUTTON 3: RIGHT BUTTON (80s)
         // =================================================================
-        else if (is_btn_right_pressed()) {
+        else if (is_btn_right_debounced()) {
             if (current_mode == MODE_80S) {
                 // Pressed 80s again while 80s running -> STOP!
                 turn_pump_off();

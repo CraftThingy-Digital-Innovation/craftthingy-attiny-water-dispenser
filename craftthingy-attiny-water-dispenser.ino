@@ -37,14 +37,8 @@
 #define MODE_80S        2
 #define MODE_CONTINUOUS 3
 
-// Power Cap: 82% PWM (205 / 250 counts at 1kHz)
-// Protects the TP4056 DW01A protection chip from exceeding its 2.5A overcurrent trip limit!
-#define PWM_TOP         249
-#define PWM_DUTY_RUN    205
-
 static volatile uint32_t system_millis = 0;
 static volatile uint8_t current_mode = MODE_IDLE;
-static volatile uint8_t pwm_enabled = 0;
 static uint32_t pump_start_time = 0;
 static uint32_t pump_duration = 0;
 
@@ -72,13 +66,6 @@ ISR(BADISR_vect) {}
 
 ISR(TIMER1_COMPA_vect) {
     system_millis++;
-    if (pwm_enabled && (current_mode != MODE_IDLE)) {
-        drive_gate_high();
-    }
-}
-
-ISR(TIMER1_COMPB_vect) {
-    drive_gate_low();
 }
 
 ISR(PCINT0_vect) {}
@@ -86,19 +73,16 @@ ISR(PCINT2_vect) {}
 
 static inline void start_timer() {
     TCCR1A = 0;
-    OCR1A = PWM_TOP;
-    OCR1B = 10;
+    OCR1A = 249;
     TCNT1 = 0;
-    TIFR1 = (1 << OCF1A) | (1 << OCF1B);
-    TIMSK1 |= (1 << OCIE1A) | (1 << OCIE1B);
+    TIFR1 = (1 << OCF1A);
+    TIMSK1 |= (1 << OCIE1A);
     TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
 }
 
 static inline void stop_timer() {
     TCCR1B = 0;
-    TIMSK1 &= ~((1 << OCIE1A) | (1 << OCIE1B));
-    drive_gate_low();
-    pwm_enabled = 0;
+    TIMSK1 &= ~(1 << OCIE1A);
 }
 
 static inline uint32_t get_millis() {
@@ -129,23 +113,30 @@ static inline uint8_t is_led_active_during_soft_start(uint8_t step, uint8_t blin
 }
 
 static void soft_start_motor(uint8_t blinks) {
-    pwm_enabled = 1;
-
     for (uint8_t step = 1; step <= 50; step++) {
-        uint16_t duty = 10 + ((uint32_t)step * (PWM_DUTY_RUN - 10)) / 50;
-        OCR1B = (uint8_t)duty;
-
         if (is_led_active_during_soft_start(step, blinks)) {
             drive_led_high();
         } else {
             drive_led_low();
         }
 
-        _delay_ms(10);
+        uint16_t on_us = (uint16_t)step * 20;
+        uint16_t off_us = 1000 - on_us;
+
+        for (uint8_t cycle = 0; cycle < 10; cycle++) {
+            if (on_us > 0) {
+                drive_gate_high();
+                delay_micros(on_us);
+            }
+            if (off_us > 0) {
+                drive_gate_low();
+                delay_micros(off_us);
+            }
+        }
     }
 
-    // Locked at safe 82% continuous power & Solid LED
-    OCR1B = PWM_DUTY_RUN;
+    // 100% Full Power Continuous Output & Solid LED
+    drive_gate_high();
     drive_led_high();
 }
 
@@ -156,6 +147,43 @@ static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
         drive_led_low();
         for (uint16_t t = 0; t < off_ms; t += 10) _delay_ms(10);
     }
+}
+
+static inline uint8_t is_btn_left_raw() {
+    return (!(PINB & (1 << PB3)) || !(PIND & (1 << PD3)));
+}
+
+static inline uint8_t is_btn_mid_raw() {
+    return (!(PINB & (1 << PB4)) || !(PIND & (1 << PD4)));
+}
+
+static inline uint8_t is_btn_right_raw() {
+    return (!(PINB & (1 << PB5)) || !(PIND & (1 << PD5)));
+}
+
+// 50ms Anti-Spark Noise Filter
+static uint8_t is_btn_left_debounced() {
+    if (is_btn_left_raw()) {
+        _delay_ms(50);
+        return is_btn_left_raw();
+    }
+    return 0;
+}
+
+static uint8_t is_btn_mid_debounced() {
+    if (is_btn_mid_raw()) {
+        _delay_ms(50);
+        return is_btn_mid_raw();
+    }
+    return 0;
+}
+
+static uint8_t is_btn_right_debounced() {
+    if (is_btn_right_raw()) {
+        _delay_ms(50);
+        return is_btn_right_raw();
+    }
+    return 0;
 }
 
 static void turn_pump_on_fresh(uint8_t mode, uint32_t duration, uint8_t blinks) {
@@ -187,18 +215,6 @@ static void enter_deep_sleep() {
     sleep_cpu();
 
     sleep_disable();
-}
-
-static inline uint8_t is_btn_left_pressed() {
-    return (!(PINB & (1 << PB3)) || !(PIND & (1 << PD3)));
-}
-
-static inline uint8_t is_btn_mid_pressed() {
-    return (!(PINB & (1 << PB4)) || !(PIND & (1 << PD4)));
-}
-
-static inline uint8_t is_btn_right_pressed() {
-    return (!(PINB & (1 << PB5)) || !(PIND & (1 << PD5)));
 }
 
 void setup() {
@@ -257,7 +273,7 @@ void loop() {
 
     uint32_t now = get_millis();
 
-    if (is_btn_left_pressed()) {
+    if (is_btn_left_debounced()) {
         if (current_mode == MODE_40S) {
             turn_pump_off(); // Same button pressed -> STOP
         } else if (current_mode == MODE_80S) {
@@ -269,7 +285,7 @@ void loop() {
         }
         _delay_ms(300);
     }
-    else if (is_btn_mid_pressed()) {
+    else if (is_btn_mid_debounced()) {
         if (current_mode != MODE_IDLE) {
             turn_pump_off(); // Running -> STOP immediately
         } else {
@@ -277,7 +293,7 @@ void loop() {
         }
         _delay_ms(300);
     }
-    else if (is_btn_right_pressed()) {
+    else if (is_btn_right_debounced()) {
         if (current_mode == MODE_80S) {
             turn_pump_off(); // Same button pressed -> STOP
         } else if (current_mode == MODE_40S) {
