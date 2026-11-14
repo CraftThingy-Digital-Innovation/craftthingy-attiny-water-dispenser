@@ -6,6 +6,13 @@
  * Clock: 16.0 MHz (Micronucleus clock)
  *
  * Smart Dispense Features:
+ *   - Diagnostics on Reset:
+ *       * If a fault occurs (Brown-out / Watchdog): blinks 2 times for diagnostics.
+ *       * If clean boot (no failure): skips diagnostic blinks.
+ *   - Mode Visual Feedback:
+ *       * 40s mode: blinks 1 time.
+ *       * 80s mode: blinks 2 times.
+ *       * Continuous mode: blinks 3 times.
  *   - Same-Button Toggle:
  *       * Press 40s while 40s is running -> STOPS immediately.
  *       * Press 80s while 80s is running -> STOPS immediately.
@@ -17,7 +24,7 @@
  *   - Middle Button:
  *       * If pump is OFF -> Starts Continuous ON.
  *       * If pump is ON (any mode) -> Cancels and STOPS immediately.
- *   - 500ms PWM Soft-Start: Protects battery BMS from inrush current.
+ *   - 100% Full Power with 500ms PWM Soft-Start: Protects battery BMS.
  *   - Ultra-low power Deep Sleep: ~0.5uA when idle.
  * =========================================================================
  */
@@ -150,12 +157,15 @@ static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
     }
 }
 
-static void turn_pump_on_fresh(uint8_t mode, uint32_t duration) {
+static void turn_pump_on_fresh(uint8_t mode, uint32_t duration, uint8_t blinks) {
     current_mode = mode;
     pump_duration = duration;
-    pump_start_time = get_millis();
+
+    // Visual mode confirmation feedback: 1 for 40s, 2 for 80s, 3 for Continuous
+    blink_led(blinks, 150, 150);
 
     start_timer();
+    pump_start_time = get_millis();
     soft_start_motor();
 }
 
@@ -218,14 +228,10 @@ int main(void) {
     PCMSK2 |= (1 << PCINT19) | (1 << PCINT20) | (1 << PCINT21);
 
     // 4. Diagnostic Reset Indicator:
-    if (reset_flags & (1 << BORF)) {
-        blink_led(3, 400, 200);
-    } else if (reset_flags & (1 << EXTRF)) {
-        blink_led(2, 400, 200);
-    } else if (reset_flags & (1 << WDRF)) {
-        blink_led(4, 150, 150);
-    } else {
-        blink_led(1, 300, 200);
+    // If a fault/failure occurred (Brown-Out BORF or Watchdog WDRF), blink 2 times first for diagnostics.
+    // If clean startup (nothing happened / no failure), do not blink error.
+    if (reset_flags & ((1 << BORF) | (1 << WDRF))) {
+        blink_led(2, 400, 250);
     }
 
     // 5. Enable Global Interrupts
@@ -254,8 +260,8 @@ int main(void) {
                 // Cancel continuous -> STOP
                 turn_pump_off();
             } else {
-                // Fresh start: 40s
-                turn_pump_on_fresh(MODE_40S, 40000UL);
+                // Fresh start: 40s (1 blink)
+                turn_pump_on_fresh(MODE_40S, 40000UL, 1);
             }
             _delay_ms(300); // Button debounce
         }
@@ -268,8 +274,8 @@ int main(void) {
                 // If running in ANY mode, cancel and stop immediately!
                 turn_pump_off();
             } else {
-                // If OFF, start continuous dispensing
-                turn_pump_on_fresh(MODE_CONTINUOUS, 0);
+                // If OFF, start continuous dispensing (3 blinks)
+                turn_pump_on_fresh(MODE_CONTINUOUS, 0, 3);
             }
             _delay_ms(300); // Button debounce
         }
@@ -285,13 +291,14 @@ int main(void) {
                 // Switched from 40s to 80s! Total target becomes 80s from initial start
                 current_mode = MODE_80S;
                 pump_duration = 80000UL;
-                // Pump continues running seamlessly to complete 80s total!
+                blink_led(2, 120, 100); // 2 blinks to confirm 80s mode
+                drive_led_high();       // Keep LED on while running
             } else if (current_mode == MODE_CONTINUOUS) {
                 // Cancel continuous -> STOP
                 turn_pump_off();
             } else {
-                // Fresh start: 80s
-                turn_pump_on_fresh(MODE_80S, 80000UL);
+                // Fresh start: 80s (2 blinks)
+                turn_pump_on_fresh(MODE_80S, 80000UL, 2);
             }
             _delay_ms(300); // Button debounce
         }

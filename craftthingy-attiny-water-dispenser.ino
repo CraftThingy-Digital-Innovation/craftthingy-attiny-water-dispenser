@@ -134,12 +134,15 @@ static void blink_led(uint8_t count, uint16_t on_ms, uint16_t off_ms) {
     }
 }
 
-static void turn_pump_on_fresh(uint8_t mode, uint32_t duration) {
+static void turn_pump_on_fresh(uint8_t mode, uint32_t duration, uint8_t blinks) {
     current_mode = mode;
     pump_duration = duration;
-    pump_start_time = get_millis();
+
+    // Visual mode confirmation feedback: 1 for 40s, 2 for 80s, 3 for Continuous
+    blink_led(blinks, 150, 150);
 
     start_timer();
+    pump_start_time = get_millis();
     soft_start_motor(); // 500ms ramp, then 100% full power!
 }
 
@@ -197,14 +200,11 @@ void setup() {
     PCMSK0 |= (1 << PCINT3) | (1 << PCINT4) | (1 << PCINT5);
     PCMSK2 |= (1 << PCINT19) | (1 << PCINT20) | (1 << PCINT21);
 
-    if (reset_flags & (1 << BORF)) {
-        blink_led(3, 400, 200);
-    } else if (reset_flags & (1 << EXTRF)) {
-        blink_led(2, 400, 200);
-    } else if (reset_flags & (1 << WDRF)) {
-        blink_led(4, 150, 150);
-    } else {
-        blink_led(1, 300, 200);
+    // Diagnostic Reset Indicator:
+    // If a fault/failure occurred (Brown-Out BORF or Watchdog WDRF), blink 2 times first for diagnostics.
+    // If clean startup (nothing happened / no failure), do not blink error.
+    if (reset_flags & ((1 << BORF) | (1 << WDRF))) {
+        blink_led(2, 400, 250);
     }
 
     sei();
@@ -226,7 +226,7 @@ void loop() {
         } else if (current_mode == MODE_CONTINUOUS) {
             turn_pump_off();
         } else {
-            turn_pump_on_fresh(MODE_40S, 40000UL);
+            turn_pump_on_fresh(MODE_40S, 40000UL, 1); // 1 blink for 40s
         }
         _delay_ms(300);
     }
@@ -234,7 +234,7 @@ void loop() {
         if (current_mode != MODE_IDLE) {
             turn_pump_off(); // Running -> STOP immediately
         } else {
-            turn_pump_on_fresh(MODE_CONTINUOUS, 0); // OFF -> Continuous ON
+            turn_pump_on_fresh(MODE_CONTINUOUS, 0, 3); // 3 blinks for Continuous
         }
         _delay_ms(300);
     }
@@ -244,10 +244,12 @@ void loop() {
         } else if (current_mode == MODE_40S) {
             current_mode = MODE_80S;
             pump_duration = 80000UL; // Extend total target to 80s!
+            blink_led(2, 120, 100);  // 2 blinks to confirm 80s mode
+            drive_led_high();        // Keep LED on while running
         } else if (current_mode == MODE_CONTINUOUS) {
             turn_pump_off();
         } else {
-            turn_pump_on_fresh(MODE_80S, 80000UL);
+            turn_pump_on_fresh(MODE_80S, 80000UL, 2); // 2 blinks for 80s
         }
         _delay_ms(300);
     }
