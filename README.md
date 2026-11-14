@@ -128,3 +128,4 @@ When connected via USB, the ATtiny88 identifies as **`USB\VID_16D0&PID_0753` (Mi
    > Please plug in the device ... (will wait 60 seconds)
    ```
 5. Plug the ATtiny88 into USB now (or press RESET).
+
